@@ -1,0 +1,11 @@
+P-LANES is licensed under the GNU AGPL-3.0.
+
+This is a Copyleft project: you are free to modify and share it, but any derivative works must also be open-source and licensed under the AGPL.
+
+Third-Party Components
+P-LANES is a modular orchestrator designed to interact with external engines, modules, and providers. The respective licenses of all integrated or linked software remain in effect, including (but not limited to):
+llama.cpp: MIT License
+Whisper: MIT License
+Kokoro: Apache 2.0 License
+
+It is the responsibility of the end user or module developer to ensure that any third-party software, libraries, or model weights used within P-LANES comply with their respective licenses and Acceptable Use Policies.
