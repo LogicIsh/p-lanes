@@ -1,4 +1,4 @@
-# p-lanes
+# p-lanes (alpha stage)
 
 A modular microkernel/wrapper for llama.cpp focused on: home-lab scaled hardware, low-latency, and KV slot pinned users.
 
@@ -40,7 +40,7 @@ By using llama.cpp as a lightweight foundation, p-lanes starts with significantl
 - **Live Transcript Stream:** Optional SSE (Server-Sent Events) endpoint that mirrors both sides of a conversation in real time. Connect a dashboard card to watch voice conversations appear as text, with chat and voice turns interleaved in a unified timeline.
 - **Three-Gate Security Model:** Layered access control that never trusts the LLM as a decision maker. Gate 1 verifies user identity at the transporter. Gate 2 enforces stage-level access floors from core config. Gate 3 checks per-module permissions declared by each addon. Each gate can only raise the bar, never lower it.
 - **Drop-In Architecture:** Modules and providers are self-contained folders with their own manifests and config files. Drop a folder in, restart, and the system auto-discovers it. Remove the folder to uninstall. Core config is never touched by addons.
-- **Full Customization:** Per-user control over model weights, summarization triggers, and KV window sizes.
+- **Full Customization:** Control over model weights, summarization triggers, and KV window sizes.
 - **Minimalist Overhead:** Headless, transparent code designed for 24/7 reliability on consumer-grade hardware.
 
 ---
