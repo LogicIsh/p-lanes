@@ -167,7 +167,7 @@ p-lanes is currently in active development. The transition from a monolithic pro
 
 - [x] Design layout and system flow.
 - [x] Kernel core coding and dispatch logic.
-- [ ] Core configuration implementation (global slots, user windows, system permissions, stage security floors).
+- [x] Core configuration implementation (global slots, user windows, system permissions, stage security floors).
 - [ ] Basic channel setup — text/API provider, stability testing.
 - [ ] Public alpha release: upload active builds to GitHub.
 - [ ] Voice channel implementation (STT + TTS provider integration).
