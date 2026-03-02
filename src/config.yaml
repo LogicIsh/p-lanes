@@ -47,16 +47,30 @@ llm:
 # ==================================================
 slots:
   count: 5                # 4 persistent users + 1 utility
-  ctx_total: 61440        # total context across all slots
+  ctx_total: 51200        # total context across all slots (set to 61440 for production)
 
 # ==================================================
 # Summarization
 # ==================================================
+# Token budgets are calculated as percentages of the
+# remaining context after subtracting the static
+# system header budget.
+#
+# Example at 12,288 per slot:
+#   remaining       = 12,288 - 128 = 12,160
+#   summary cap     = 12,160 * 0.10 = 1,216 tokens
+#   recent budget   = 12,160 * 0.15 = 1,824 tokens
+#   post-summarize  = ~30% of slot
+#   headroom to crit = ~50% of slot (~27-33 exchanges)
+#
 summarization:
   threshold_warn: 0.70    # flag_warn — background summarize when idle
   threshold_crit: 0.80    # flag_crit — immediate summarize
   lock_wait: 6            # seconds to wait for slot lock before dropping
-  keep_recent: 4          # recent messages to preserve after summarize
+  system_header_budget: 128       # static token budget for system prompt/persona
+  summary_max_percent: 0.10       # max summary size as % of remaining context
+  keep_recent_percent: 0.15       # recent messages to keep as % of remaining context
+  chars_per_token: 3              # conservative estimate for token budgeting (lower = safer)
   scheduled:
     enabled: true
     cron: "0 2 * * *"     # daily at 0200

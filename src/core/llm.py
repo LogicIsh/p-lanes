@@ -7,13 +7,17 @@
 # ==================================================
 # llama.cpp server process lifecycle and all LLM
 # communication. Start, stop, call, parse response.
-# Token tracking from usage — never accumulated.
+# Token tracking from usage -- never accumulated.
 # Supports blocking, streaming (SSE), and utility
 # slot calls (no conversation history impact).
 #
 # Crash recovery: reactive (inside call/stream when
 # server is unreachable) and proactive (health check
 # called from background loop in summarizer).
+#
+# Context overflow: detects when a slot exceeds its
+# context window and raises LLMContextOverflow so the
+# caller can trigger summarization and retry.
 #
 # Knows about: config (LLM settings, thresholds,
 #              paths, recovery), slots (User object).
@@ -71,7 +75,7 @@ def set_session(session: aiohttp.ClientSession):
 
 def get_session() -> aiohttp.ClientSession:
     if _session is None:
-        raise RuntimeError("LLM session not initialized — call set_session() first")
+        raise RuntimeError("LLM session not initialized -- call set_session() first")
     return _session
 
 
@@ -144,7 +148,7 @@ def get_pid() -> int | None:
 
 
 # ==================================================
-# Health Check (public — used by background monitor)
+# Health Check (public -- used by background monitor)
 # ==================================================
 
 async def health_check() -> bool:
@@ -163,11 +167,11 @@ async def health_check() -> bool:
 # ==================================================
 
 async def attempt_recovery() -> bool:
-    # public entry point — called by both call() and
+    # public entry point -- called by both call() and
     # the background health monitor. Lock prevents
     # concurrent restart attempts from racing.
     async with _recovery_lock:
-        # if someone else already recovered while we waited for the lock
+        # if someone else already recovered while we waited
         if is_running() and await health_check():
             return True
         return await _recover_with_backoff()
@@ -197,7 +201,22 @@ async def _recover_with_backoff() -> bool:
 
 
 # ==================================================
-# Inference — Blocking
+# Error Detection Helpers
+# ==================================================
+
+def _is_context_overflow(status: int, error_text: str) -> bool:
+    # detect llama.cpp context size exceeded error
+    if status != 400:
+        return False
+    try:
+        err = json.loads(error_text)
+        return err.get("error", {}).get("type") == "exceed_context_size_error"
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+# ==================================================
+# Inference -- Blocking
 # ==================================================
 
 async def call(user: User, message: str) -> "LLMResponse":
@@ -212,6 +231,16 @@ async def call(user: User, message: str) -> "LLMResponse":
         async with session.post(LLM_URL, json=payload) as resp:
             if resp.status != 200:
                 err = await resp.text()
+
+                # context overflow -- let caller handle summarization
+                if _is_context_overflow(resp.status, err):
+                    user.conversation_history.pop()
+                    log.warning("llm_context_overflow",
+                                user_id=user.user_id, slot=user.slot)
+                    raise LLMContextOverflow(
+                        f"Slot {user.slot} context exceeded for {user.user_id}"
+                    )
+
                 log.error("llm_call_failed", status=resp.status, error=err)
                 user.conversation_history.pop()
                 raise LLMCallError(f"LLM returned {resp.status}")
@@ -221,7 +250,7 @@ async def call(user: User, message: str) -> "LLMResponse":
         user.conversation_history.pop()
         log.warning("llm_unreachable_attempting_recovery", error=str(e))
 
-        # attempt crash recovery — retry once if successful
+        # attempt crash recovery -- retry once if successful
         if await attempt_recovery():
             return await _retry_call(user, message)
 
@@ -250,14 +279,14 @@ async def call(user: User, message: str) -> "LLMResponse":
 
 
 async def _retry_call(user: User, message: str) -> "LLMResponse":
-    # single retry after successful recovery — message is already
+    # single retry after successful recovery -- message is already
     # removed from history by the caller, so call() re-adds it
     log.info("llm_retrying_after_recovery", user_id=user.user_id)
     return await call(user, message)
 
 
 # ==================================================
-# Inference — Streaming (SSE)
+# Inference -- Streaming (SSE)
 # ==================================================
 
 async def call_stream(user: User, message: str) -> AsyncIterator[str]:
@@ -275,6 +304,16 @@ async def call_stream(user: User, message: str) -> AsyncIterator[str]:
         async with session.post(LLM_URL, json=payload) as resp:
             if resp.status != 200:
                 err = await resp.text()
+
+                # context overflow
+                if _is_context_overflow(resp.status, err):
+                    user.conversation_history.pop()
+                    log.warning("llm_stream_context_overflow",
+                                user_id=user.user_id, slot=user.slot)
+                    raise LLMContextOverflow(
+                        f"Slot {user.slot} context exceeded for {user.user_id}"
+                    )
+
                 log.error("llm_stream_failed", status=resp.status, error=err)
                 user.conversation_history.pop()
                 raise LLMCallError(f"LLM returned {resp.status}")
@@ -340,7 +379,7 @@ async def call_stream(user: User, message: str) -> AsyncIterator[str]:
 
 
 # ==================================================
-# Inference — Utility Slot (no history impact)
+# Inference -- Utility Slot (no history impact)
 # ==================================================
 
 async def call_utility(
@@ -356,7 +395,7 @@ async def call_utility(
     utility_slot = SLOT_MAP.get("utility")
     if utility_slot is None:
         raise LLMCallError(
-            "Utility slot not configured — add 'utility' to users in config.yaml"
+            "Utility slot not configured -- add 'utility' to users in config.yaml"
         )
 
     payload = {
@@ -453,4 +492,8 @@ class LLMResponse:
 
 
 class LLMCallError(Exception):
+    pass
+
+
+class LLMContextOverflow(Exception):
     pass

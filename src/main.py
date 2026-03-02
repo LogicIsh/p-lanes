@@ -9,8 +9,8 @@
 # Knows about: slots, llm, service, transport,
 #              summarizer, events, log, pipeline.
 # Wires them at startup. Orchestrates the pipeline:
-#   Channel → Transporter → Classifier → Enricher
-#   → Processor → Responder → Finalizer → Channel
+#   Channel -> Transporter -> Classifier -> Enricher
+#   -> Processor -> Responder -> Finalizer -> Channel
 # Must never contain business logic.
 #
 # Run with:
@@ -31,6 +31,7 @@ from fastapi import FastAPI
 from config import LLM_TIMEOUT
 from core.log import setup_logging
 from core import llm, slots, summarizer
+from core.llm import LLMContextOverflow
 from core.pipeline import PipelineContext
 from core.transport import create_routes
 from service import service as svc
@@ -85,7 +86,7 @@ app = FastAPI(title="p-lanes", lifespan=lifespan)
 
 
 # ==================================================
-# Pipeline — Blocking
+# Pipeline -- Blocking
 # ==================================================
 
 async def handle_message(user_id: str, message: str) -> str:
@@ -109,7 +110,21 @@ async def handle_message(user_id: str, message: str) -> str:
     # --- processor (LLM) ---
     if not ctx.skip_processor:
         prompt = ctx.build_enriched_prompt()
-        response = await llm.call(user, prompt)
+
+        try:
+            response = await llm.call(user, prompt)
+        except LLMContextOverflow:
+            # context full -- summarize and retry once
+            await summarizer.emergency_summarize(user)
+            try:
+                response = await llm.call(user, prompt)
+            except LLMContextOverflow:
+                # still overflowing after summarization -- something
+                # is seriously wrong, but don't brick the user
+                log.error("context_overflow_after_summarize",
+                           user_id=user.user_id)
+                return "My memory is full. I've cleaned up what I can -- try again."
+
         ctx.response_text  = response.content
         ctx.total_tokens   = response.total_tokens
         ctx.truncated      = response.truncated
@@ -127,7 +142,7 @@ async def handle_message(user_id: str, message: str) -> str:
 
 
 # ==================================================
-# Pipeline — Streaming
+# Pipeline -- Streaming
 # ==================================================
 
 async def handle_stream(user_id: str, message: str) -> AsyncIterator[str]:
@@ -150,23 +165,31 @@ async def handle_stream(user_id: str, message: str) -> AsyncIterator[str]:
             yield "Give me just a second..."
             return
 
-    # --- processor (LLM) — streaming ---
+    # --- processor (LLM) -- streaming ---
     if not ctx.skip_processor:
         prompt = ctx.build_enriched_prompt()
-        async for chunk in llm.call_stream(user, prompt):
-            yield chunk
+
+        try:
+            async for chunk in llm.call_stream(user, prompt):
+                yield chunk
+        except LLMContextOverflow:
+            # context full -- summarize and retry once
+            await summarizer.emergency_summarize(user)
+            try:
+                async for chunk in llm.call_stream(user, prompt):
+                    yield chunk
+            except LLMContextOverflow:
+                log.error("stream_context_overflow_after_summarize",
+                           user_id=user.user_id)
+                yield "My memory is full. I've cleaned up what I can -- try again."
+                return
 
         # fire background summarization if critical
         if user.flag_crit:
             asyncio.create_task(summarizer.summarize_if_needed(user))
 
     elif ctx.response_text:
-        # classifier/enricher provided a response without LLM
         yield ctx.response_text
-
-    # note: responder/finalizer run post-stream
-    # the complete response is in user.conversation_history
-    # finalizer can modify output for next request or log
 
 
 # ==================================================

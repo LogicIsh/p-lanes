@@ -75,7 +75,7 @@ KV_CACHE_TYPE       = _cfg["llm"]["kv_cache_type"]
 # ==================================================
 # LLM Crash Recovery
 # ==================================================
-_recovery_cfg       = _cfg["llm"].get("recovery", {})
+_recovery_cfg         = _cfg["llm"].get("recovery", {})
 RECOVERY_MAX_RETRIES  = _recovery_cfg.get("max_retries", 5)
 RECOVERY_INITIAL_WAIT = _recovery_cfg.get("initial_wait", 5)
 RECOVERY_MAX_WAIT     = _recovery_cfg.get("max_wait", 120)
@@ -90,16 +90,28 @@ CONTEXT_PER_SLOT = CONTEXT_TOTAL // SLOT_COUNT
 # ==================================================
 # Summarization
 # ==================================================
-THRESHOLD_WARN      = _cfg["summarization"]["threshold_warn"]
-THRESHOLD_CRIT      = _cfg["summarization"]["threshold_crit"]
-SUMMARIZE_LOCK_WAIT = _cfg["summarization"]["lock_wait"]
-KEEP_RECENT         = _cfg["summarization"]["keep_recent"]
-SCHEDULED_SUMMARY   = _cfg["summarization"]["scheduled"]
+_sum_cfg = _cfg["summarization"]
+
+THRESHOLD_WARN        = _sum_cfg["threshold_warn"]
+THRESHOLD_CRIT        = _sum_cfg["threshold_crit"]
+SUMMARIZE_LOCK_WAIT   = _sum_cfg["lock_wait"]
+SCHEDULED_SUMMARY     = _sum_cfg["scheduled"]
+
+# token budget settings
+SYSTEM_HEADER_BUDGET  = _sum_cfg.get("system_header_budget", 128)
+SUMMARY_MAX_PERCENT   = _sum_cfg.get("summary_max_percent", 0.10)
+KEEP_RECENT_PERCENT   = _sum_cfg.get("keep_recent_percent", 0.15)
+CHARS_PER_TOKEN       = _sum_cfg.get("chars_per_token", 3)
+
+# derived budgets (based on slot size minus static header)
+_REMAINING_CONTEXT    = CONTEXT_PER_SLOT - SYSTEM_HEADER_BUDGET
+SUMMARY_MAX_TOKENS    = int(_REMAINING_CONTEXT * SUMMARY_MAX_PERCENT)
+KEEP_RECENT_TOKENS    = int(_REMAINING_CONTEXT * KEEP_RECENT_PERCENT)
 
 # ==================================================
 # Idle / Background Checks
 # ==================================================
-USER_IDLE_TIMEOUT  = _cfg["idle"]["timeout"]
+USER_IDLE_TIMEOUT   = _cfg["idle"]["timeout"]
 IDLE_CHECK_INTERVAL = _cfg["idle"].get("check_interval", 120)
 
 # ==================================================

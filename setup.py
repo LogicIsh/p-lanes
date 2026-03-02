@@ -7,7 +7,7 @@
 #
 # ==================================================
 # Interactive installer and configurator for p-lanes.
-# Detects if system is already installed — offers
+# Detects if system is already installed -- offers
 # configure-only mode if so. Generates config.yaml
 # and creates required directories and systemd service.
 #
@@ -76,7 +76,10 @@ DEFAULT_CONFIG = {
         "threshold_warn": 0.70,
         "threshold_crit": 0.80,
         "lock_wait": 6,
-        "keep_recent": 4,
+        "system_header_budget": 128,
+        "summary_max_percent": 0.10,
+        "keep_recent_percent": 0.15,
+        "chars_per_token": 3,
         "scheduled": {
             "enabled": True,
             "cron": "0 2 * * *",
@@ -120,7 +123,7 @@ SECURITY_REVERSE = {v: k for k, v in SECURITY_LABELS.items()}
 def banner():
     print()
     print("=" * 50)
-    print("  p-lanes Setup — Logic-Ish Designs")
+    print("  p-lanes Setup -- Logic-Ish Designs")
     print("=" * 50)
     print()
 
@@ -137,7 +140,7 @@ def ask_int(prompt: str, default: int) -> int:
         try:
             return int(raw)
         except ValueError:
-            print("    → Please enter a number.")
+            print("    -> Please enter a number.")
 
 
 def ask_float(prompt: str, default: float) -> float:
@@ -146,7 +149,7 @@ def ask_float(prompt: str, default: float) -> float:
         try:
             return float(raw)
         except ValueError:
-            print("    → Please enter a number.")
+            print("    -> Please enter a number.")
 
 
 def ask_bool(prompt: str, default: bool = True) -> bool:
@@ -181,13 +184,13 @@ def configure() -> dict:
         _deep_update(cfg, existing)
 
     # --- identity ---
-    print("— Identity —")
+    print("-- Identity --")
     cfg["brain"]["name"] = ask("Assistant name", cfg["brain"]["name"])
     cfg["brain"]["description"] = ask("Description", cfg["brain"]["description"])
     print()
 
     # --- paths ---
-    print("— Paths —")
+    print("-- Paths --")
     cfg["paths"]["model"] = ask_path("Model path", cfg["paths"]["model"])
     cfg["paths"]["projector"] = ask_path("Projector path", cfg["paths"]["projector"])
     cfg["paths"]["llama_server"] = ask_path("llama-server path", cfg["paths"]["llama_server"])
@@ -196,26 +199,26 @@ def configure() -> dict:
     print()
 
     # --- network ---
-    print("— Network —")
+    print("-- Network --")
     cfg["network"]["brain_port"] = ask_int("p-lanes port", cfg["network"]["brain_port"])
     cfg["network"]["llm_port"] = ask_int("LLM port", cfg["network"]["llm_port"])
     print()
 
     # --- slots ---
-    print("— Slots / KV Cache —")
+    print("-- Slots / KV Cache --")
     cfg["slots"]["count"] = ask_int("Total slots (users + utility)", cfg["slots"]["count"])
     cfg["slots"]["ctx_total"] = ask_int("Total context tokens", cfg["slots"]["ctx_total"])
     print()
 
     # --- users ---
-    print("— Users —")
+    print("-- Users --")
     print("  Define users and their slot assignments.")
     print("  Security levels: GUEST=0, USER=1, POWER=2, TRUSTED=3, ADMIN=4")
     print()
 
     users = {}
     slot_idx = 0
-    max_user_slots = cfg["slots"]["count"] - 1  # reserve last for utility
+    max_user_slots = cfg["slots"]["count"] - 1
 
     while slot_idx < max_user_slots:
         name = ask(f"  User {slot_idx} name (blank to stop)", "")
@@ -225,7 +228,7 @@ def configure() -> dict:
         sec_str = ask(f"    Security level for '{name}'", "USER").upper()
         sec_level = SECURITY_REVERSE.get(sec_str, 1)
         users[name] = {"slot": slot_idx, "security": sec_level}
-        print(f"    → {name}: slot {slot_idx}, {SECURITY_LABELS[sec_level]}")
+        print(f"    -> {name}: slot {slot_idx}, {SECURITY_LABELS[sec_level]}")
         slot_idx += 1
 
     # guest account
@@ -235,25 +238,46 @@ def configure() -> dict:
 
     if guest_enabled and "guest" not in users:
         users["guest"] = {"slot": slot_idx, "security": 0}
-        print(f"    → guest: slot {slot_idx}, GUEST")
+        print(f"    -> guest: slot {slot_idx}, GUEST")
         slot_idx += 1
 
-    # utility slot — always last
+    # utility slot -- always last
     utility_slot = cfg["slots"]["count"] - 1
     users["utility"] = {"slot": utility_slot, "security": 4}
-    print(f"    → utility: slot {utility_slot}, ADMIN")
+    print(f"    -> utility: slot {utility_slot}, ADMIN")
 
     cfg["users"] = users
     print()
 
     # --- summarization ---
-    print("— Summarization —")
+    print("-- Summarization --")
     cfg["summarization"]["threshold_warn"] = ask_float(
         "Warning threshold (0-1)", cfg["summarization"]["threshold_warn"])
     cfg["summarization"]["threshold_crit"] = ask_float(
         "Critical threshold (0-1)", cfg["summarization"]["threshold_crit"])
-    cfg["summarization"]["keep_recent"] = ask_int(
-        "Messages to keep after summary", cfg["summarization"]["keep_recent"])
+    cfg["summarization"]["system_header_budget"] = ask_int(
+        "System header token budget (static)",
+        cfg["summarization"]["system_header_budget"])
+    cfg["summarization"]["summary_max_percent"] = ask_float(
+        "Summary max (% of remaining context)",
+        cfg["summarization"]["summary_max_percent"])
+    cfg["summarization"]["keep_recent_percent"] = ask_float(
+        "Recent messages (% of remaining context)",
+        cfg["summarization"]["keep_recent_percent"])
+
+    # show the user what this means for their slot size
+    slot_ctx = cfg["slots"]["ctx_total"] // cfg["slots"]["count"]
+    remaining = slot_ctx - cfg["summarization"]["system_header_budget"]
+    summary_cap = int(remaining * cfg["summarization"]["summary_max_percent"])
+    recent_cap = int(remaining * cfg["summarization"]["keep_recent_percent"])
+    headroom = int(slot_ctx * cfg["summarization"]["threshold_crit"]) - (
+        cfg["summarization"]["system_header_budget"] + summary_cap + recent_cap)
+    print()
+    print(f"    At {slot_ctx} tokens/slot:")
+    print(f"      Summary cap:  ~{summary_cap} tokens")
+    print(f"      Recent keep:  ~{recent_cap} tokens")
+    print(f"      Headroom:     ~{headroom} tokens until next summarize")
+    print()
 
     sched_enabled = ask_bool("Enable scheduled daily summary?",
                               cfg["summarization"]["scheduled"]["enabled"])
@@ -268,7 +292,7 @@ def configure() -> dict:
     print()
 
     # --- idle / background ---
-    print("— Idle / Background Checks —")
+    print("-- Idle / Background Checks --")
     cfg["idle"]["timeout"] = ask_int(
         "Idle timeout (seconds)", cfg["idle"]["timeout"])
     cfg["idle"]["check_interval"] = ask_int(
@@ -276,7 +300,7 @@ def configure() -> dict:
     print()
 
     # --- logging ---
-    print("— Logging —")
+    print("-- Logging --")
     cfg["logging"]["level"] = ask("Log level (DEBUG/INFO/WARNING/ERROR)",
                                    cfg["logging"]["level"]).upper()
     fmt = ask("Log format (json/console)", cfg["logging"]["format"]).lower()
@@ -291,7 +315,7 @@ def configure() -> dict:
 # ==================================================
 
 def install(cfg: dict):
-    print("— Installing —")
+    print("-- Installing --")
 
     # create directories
     dirs = [
@@ -300,27 +324,27 @@ def install(cfg: dict):
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
-        print(f"  ✓ Created {d}")
+        print(f"  OK Created {d}")
 
     # create user data directories
     for uid in cfg["users"]:
         user_dir = Path(cfg["paths"]["user_data_root"]) / uid
         user_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  ✓ Created user dir: {user_dir}")
+        print(f"  OK Created user dir: {user_dir}")
 
     # write config
     with open(CONFIG_PATH, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-    print(f"  ✓ Config written to {CONFIG_PATH}")
+    print(f"  OK Config written to {CONFIG_PATH}")
 
     # systemd service
     if ask_bool("Create systemd service?", True):
         _create_service(cfg)
 
     print()
-    print("  ✓ Installation complete!")
+    print("  OK Installation complete!")
     print(f"    Start with: systemctl start {SERVICE_NAME}")
-    print(f"    Or manually: uvicorn main:app --host 0.0.0.0 --port {cfg['network']['brain_port']}")
+    print(f"    Or manually: cd src && uvicorn main:app --host 0.0.0.0 --port {cfg['network']['brain_port']}")
     print()
 
 
@@ -329,14 +353,14 @@ def _create_service(cfg: dict):
     uvicorn_path = shutil.which("uvicorn")
 
     if not uvicorn_path:
-        print("  ⚠ uvicorn not found in PATH — skipping service creation")
+        print("  WARNING uvicorn not found in PATH -- skipping service creation")
         return
 
     port = cfg["network"]["brain_port"]
     host = cfg["network"]["brain_host"]
 
     service_content = f"""[Unit]
-Description=p-lanes — Local AI Assistant
+Description=p-lanes -- Local AI Assistant
 After=network.target
 
 [Service]
@@ -354,11 +378,11 @@ WantedBy=multi-user.target
     try:
         SERVICE_FILE.write_text(service_content)
         subprocess.run(["systemctl", "daemon-reload"], check=True, capture_output=True)
-        print(f"  ✓ Systemd service created: {SERVICE_FILE}")
+        print(f"  OK Systemd service created: {SERVICE_FILE}")
     except PermissionError:
-        print(f"  ⚠ Permission denied writing {SERVICE_FILE} — run as root or use sudo")
+        print(f"  WARNING Permission denied writing {SERVICE_FILE} -- run as root or use sudo")
     except Exception as e:
-        print(f"  ⚠ Failed to create service: {e}")
+        print(f"  WARNING Failed to create service: {e}")
 
 
 # ==================================================
@@ -404,7 +428,6 @@ def main():
     if ask_bool("Proceed with installation?", True):
         install(cfg)
     else:
-        # save config only
         with open(CONFIG_PATH, "w") as f:
             yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
         print(f"  Config saved to {CONFIG_PATH} (no install performed)")
