@@ -168,8 +168,8 @@ p-lanes is currently in active development. The transition from a monolithic pro
 - [x] Design layout and system flow.
 - [x] Kernel core coding and dispatch logic.
 - [x] Core configuration implementation (global slots, user windows, system permissions, stage security floors).
-- [ ] Basic channel setup — text/API provider, stability testing.
-- [ ] Public alpha release: upload active builds to GitHub.
+- [x] Basic channel setup — text/API provider, stability testing.
+- [x] Public alpha release: upload active builds to GitHub.
 - [ ] Voice channel implementation (STT + TTS provider integration).
 - [ ] Multi-channel support — simultaneous voice + chat on the same user slot.
 - [ ] Basic classifier and enricher modules (Home Assistant integration).
