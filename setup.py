@@ -33,7 +33,7 @@ import yaml
 # ==================================================
 
 INSTALL_DIR     = Path(__file__).parent.resolve()
-CONFIG_PATH     = INSTALL_DIR / "config.yaml"
+CONFIG_PATH     = INSTALL_DIR / "/src/config.yaml"
 SERVICE_NAME    = "p-lanes"
 SERVICE_FILE    = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 
@@ -341,7 +341,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory={INSTALL_DIR}
+WorkingDirectory={INSTALL_DIR / "src"}
 ExecStart={uvicorn_path} main:app --host {host} --port {port}
 Restart=on-failure
 RestartSec=5
