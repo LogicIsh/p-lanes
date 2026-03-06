@@ -7,11 +7,19 @@
 # ==================================================
 # Microkernel entry point.
 # Knows about: slots, llm, service, transport,
-#              summarizer, events, log, pipeline.
+#              summarizer, events, log, pipeline,
+#              broadcast.
 # Wires them at startup. Orchestrates the pipeline:
 #   Channel -> Transporter -> Classifier -> Enricher
 #   -> Processor -> Responder -> Finalizer -> Channel
 # Must never contain business logic.
+#
+# Streaming post-processor:
+#   After the LLM stream completes, accumulated text
+#   is placed into ctx.response_text and the post-
+#   processor (responder + finalizer) runs silently
+#   for side effects. This unblocks responder modules
+#   like TTS that need the complete response text.
 #
 # Run with:
 #   uvicorn main:app --host 0.0.0.0 --port 7860
@@ -30,7 +38,7 @@ from fastapi import FastAPI
 
 from config import LLM_TIMEOUT
 from core.log import setup_logging
-from core import llm, slots, summarizer
+from core import llm, slots, summarizer, broadcast
 from core.llm import LLMContextOverflow
 from core.pipeline import PipelineContext
 from core.transport import create_routes
@@ -89,11 +97,19 @@ app = FastAPI(title="p-lanes", lifespan=lifespan)
 # Pipeline -- Blocking
 # ==================================================
 
-async def handle_message(user_id: str, message: str) -> str:
+async def handle_message(
+    user_id: str,
+    message: str,
+    conversation_id: str | None = None,
+) -> str:
     user = slots.get_user(user_id)
 
     # build pipeline context
-    ctx = PipelineContext(user=user, raw_message=message)
+    ctx = PipelineContext(
+        user=user,
+        raw_message=message,
+        conversation_id=conversation_id,
+    )
 
     # --- classifier + enricher ---
     ctx = await svc.run_pre_processor(ctx)
@@ -101,7 +117,7 @@ async def handle_message(user_id: str, message: str) -> str:
     if ctx.aborted:
         return ctx.abort_reason or "Request cancelled."
 
-    # --- check slot lock (summarization in progress) ---
+    # --- check slot lock (in-place summarization in progress) ---
     if user.slot_lock.locked():
         released = await summarizer.wait_for_lock(user)
         if not released:
@@ -137,19 +153,31 @@ async def handle_message(user_id: str, message: str) -> str:
     # --- responder + finalizer ---
     ctx = await svc.run_post_processor(ctx)
 
-    # return finalizer output if set, otherwise response_text
-    return ctx.final_output or ctx.response_text
+    result = ctx.final_output or ctx.response_text
+
+    # broadcast to any listeners (no-op if disabled)
+    broadcast.publish(user_id, {"event": "response", "data": result})
+
+    return result
 
 
 # ==================================================
 # Pipeline -- Streaming
 # ==================================================
 
-async def handle_stream(user_id: str, message: str) -> AsyncIterator[str]:
+async def handle_stream(
+    user_id: str,
+    message: str,
+    conversation_id: str | None = None,
+) -> AsyncIterator[str]:
     user = slots.get_user(user_id)
 
     # build pipeline context
-    ctx = PipelineContext(user=user, raw_message=message)
+    ctx = PipelineContext(
+        user=user,
+        raw_message=message,
+        conversation_id=conversation_id,
+    )
 
     # --- classifier + enricher ---
     ctx = await svc.run_pre_processor(ctx)
@@ -166,18 +194,25 @@ async def handle_stream(user_id: str, message: str) -> AsyncIterator[str]:
             return
 
     # --- processor (LLM) -- streaming ---
+    accumulated = []
+
     if not ctx.skip_processor:
         prompt = ctx.build_enriched_prompt()
 
         try:
             async for chunk in llm.call_stream(user, prompt):
+                accumulated.append(chunk)
                 yield chunk
+                broadcast.publish(user_id, {"event": "token", "data": chunk})
         except LLMContextOverflow:
             # context full -- summarize and retry once
+            accumulated.clear()
             await summarizer.emergency_summarize(user)
             try:
                 async for chunk in llm.call_stream(user, prompt):
+                    accumulated.append(chunk)
                     yield chunk
+                    broadcast.publish(user_id, {"event": "token", "data": chunk})
             except LLMContextOverflow:
                 log.error("stream_context_overflow_after_summarize",
                            user_id=user.user_id)
@@ -189,7 +224,17 @@ async def handle_stream(user_id: str, message: str) -> AsyncIterator[str]:
             asyncio.create_task(summarizer.summarize_if_needed(user))
 
     elif ctx.response_text:
+        accumulated.append(ctx.response_text)
         yield ctx.response_text
+
+    # --- responder + finalizer (silent, side effects only) ---
+    # populate response_text so post-processor modules have
+    # access to the complete response (e.g. for TTS, logging)
+    ctx.response_text = "".join(accumulated)
+    ctx = await svc.run_post_processor(ctx)
+
+    # broadcast done to any listeners
+    broadcast.publish(user_id, {"event": "done", "data": ""})
 
 
 # ==================================================

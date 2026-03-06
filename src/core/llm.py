@@ -8,7 +8,7 @@
 # llama.cpp server process lifecycle and all LLM
 # communication. Start, stop, call, parse response.
 # Token tracking from usage -- never accumulated.
-# Supports blocking, streaming (SSE), and utility
+# Supports blocking, streaming (SSE), and internal
 # slot calls (no conversation history impact).
 #
 # Crash recovery: reactive (inside call/stream when
@@ -48,6 +48,7 @@ from config import (
     RECOVERY_INITIAL_WAIT,
     RECOVERY_MAX_WAIT,
     SLOT_MAP,
+    UTILITY_ENABLED,
 )
 from core.slots import User
 
@@ -379,24 +380,45 @@ async def call_stream(user: User, message: str) -> AsyncIterator[str]:
 
 
 # ==================================================
-# Inference -- Utility Slot (no history impact)
+# Inference -- Internal (background tasks)
+# ==================================================
+# Generalized internal call that can target any slot.
+# Used for summarization, think-mode reviews, prompt
+# rewrites, and other tasks that don't belong in a
+# user's conversation history.
+#
+# When utility lane is enabled:  targets utility slot
+# When utility lane is disabled: targets the given
+#   fallback_slot (the requesting user's slot)
 # ==================================================
 
-async def call_utility(
+async def call_internal(
     messages: list[dict],
     temperature: float = 0.3,
     max_tokens: int = 512,
+    fallback_slot: int | None = None,
 ) -> "LLMResponse":
-    # call the LLM using the utility slot without
-    # touching any user's conversation history.
-    # used for summarization, think-mode reviews,
-    # prompt rewrites, and other internal tasks.
-
-    utility_slot = SLOT_MAP.get("utility")
-    if utility_slot is None:
-        raise LLMCallError(
-            "Utility slot not configured -- add 'utility' to users in config.yaml"
-        )
+    # determine which slot to use
+    if UTILITY_ENABLED:
+        slot_id = SLOT_MAP.get("utility")
+        if slot_id is None:
+            # config mismatch -- utility enabled but not in slot map
+            # fall back to user slot if available
+            if fallback_slot is not None:
+                slot_id = fallback_slot
+                log.warning("utility_slot_missing_using_fallback",
+                             fallback_slot=fallback_slot)
+            else:
+                raise LLMCallError(
+                    "Utility slot not configured and no fallback provided"
+                )
+    else:
+        if fallback_slot is None:
+            raise LLMCallError(
+                "Utility lane disabled and no fallback_slot provided. "
+                "Caller must pass the user's slot for in-place operation."
+            )
+        slot_id = fallback_slot
 
     payload = {
         "model":        "local",
@@ -404,7 +426,7 @@ async def call_utility(
         "temperature":  temperature,
         "max_tokens":   max_tokens,
         "stream":       False,
-        "id_slot":      utility_slot,
+        "id_slot":      slot_id,
         "cache_prompt": False,
     }
 
@@ -415,14 +437,14 @@ async def call_utility(
         async with session.post(LLM_URL, json=payload) as resp:
             if resp.status != 200:
                 err = await resp.text()
-                log.error("llm_utility_call_failed",
-                           status=resp.status, error=err)
-                raise LLMCallError(f"Utility call returned {resp.status}")
+                log.error("llm_internal_call_failed",
+                           slot=slot_id, status=resp.status, error=err)
+                raise LLMCallError(f"Internal call on slot {slot_id} returned {resp.status}")
             data = await resp.json()
 
     except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-        log.warning("llm_utility_unreachable", error=str(e))
-        raise LLMCallError(f"LLM unreachable for utility call: {e}") from e
+        log.warning("llm_internal_unreachable", slot=slot_id, error=str(e))
+        raise LLMCallError(f"LLM unreachable for internal call on slot {slot_id}: {e}") from e
 
     elapsed = time.perf_counter() - t0
     text = data["choices"][0]["message"]["content"].strip()
@@ -430,8 +452,8 @@ async def call_utility(
     usage        = data.get("usage", {})
     total_tokens = usage.get("total_tokens", 0)
 
-    log.info("llm_utility_response",
-             elapsed=f"{elapsed:.2f}s",
+    log.info("llm_internal_response",
+             slot=slot_id, elapsed=f"{elapsed:.2f}s",
              tokens=total_tokens, chars=len(text))
 
     return LLMResponse(
@@ -439,6 +461,24 @@ async def call_utility(
         elapsed=elapsed,
         total_tokens=total_tokens,
         truncated=False,
+    )
+
+
+# ==================================================
+# Backward Compatibility -- call_utility wraps
+# call_internal for any existing callers
+# ==================================================
+
+async def call_utility(
+    messages: list[dict],
+    temperature: float = 0.3,
+    max_tokens: int = 512,
+) -> "LLMResponse":
+    return await call_internal(
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        fallback_slot=None,
     )
 
 

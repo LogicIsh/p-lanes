@@ -152,6 +152,25 @@ for uid, udata in _users_cfg.items():
 GUEST_ENABLED = _cfg.get("guest", {}).get("enabled", True)
 
 # ==================================================
+# Utility Lane
+# ==================================================
+# When enabled, background tasks (summarization, etc.)
+# run on the dedicated utility slot without blocking
+# the user. When disabled, tasks fall back to the
+# requesting user's own slot with a brief lock.
+# ==================================================
+UTILITY_ENABLED = _cfg.get("utility", {}).get("enabled", True)
+
+# safety check: utility toggled on but not in slot map
+if UTILITY_ENABLED and "utility" not in SLOT_MAP:
+    import warnings
+    warnings.warn(
+        "utility.enabled is true but 'utility' is not in users config. "
+        "Falling back to user-slot summarization."
+    )
+    UTILITY_ENABLED = False
+
+# ==================================================
 # Module Permissions
 # ==================================================
 MODULE_PERMISSIONS: dict[str, int] = _cfg.get("module_permissions", {}) or {}

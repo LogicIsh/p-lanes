@@ -125,6 +125,18 @@ guest:
   enabled: true
 
 # ==================================================
+# Utility Lane
+# ==================================================
+# When enabled, summarization and other background
+# tasks run on the dedicated utility slot without
+# blocking the user. When disabled, background tasks
+# fall back to the requesting user's own slot with
+# a brief lock.
+# ==================================================
+utility:
+  enabled: true
+
+# ==================================================
 # Module Permissions
 # ==================================================
 # module_name: minimum_security_level

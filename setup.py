@@ -100,6 +100,7 @@ DEFAULT_CONFIG = {
     },
     "users": {},
     "guest": {"enabled": True},
+    "utility": {"enabled": True},
     "module_permissions": {},
     "logging": {
         "level": "INFO",
@@ -204,9 +205,24 @@ def configure() -> dict:
     cfg["network"]["llm_port"] = ask_int("LLM port", cfg["network"]["llm_port"])
     print()
 
+    # --- utility lane ---
+    print("-- Utility Lane --")
+    utility_enabled = ask_bool(
+        "Enable dedicated utility lane? (async summarization, no user blocking)",
+        cfg["utility"]["enabled"],
+    )
+    cfg["utility"]["enabled"] = utility_enabled
+    if not utility_enabled:
+        print("    -> Utility lane disabled. Summarization will run on user slots.")
+    print()
+
     # --- slots ---
     print("-- Slots / KV Cache --")
-    cfg["slots"]["count"] = ask_int("Total slots (users + utility)", cfg["slots"]["count"])
+    if utility_enabled:
+        cfg["slots"]["count"] = ask_int("Total slots (users + utility)", cfg["slots"]["count"])
+    else:
+        # no utility slot -- all slots are user slots
+        cfg["slots"]["count"] = ask_int("Total slots (users only, no utility)", cfg["slots"]["count"])
     cfg["slots"]["ctx_total"] = ask_int("Total context tokens", cfg["slots"]["ctx_total"])
     print()
 
@@ -218,7 +234,8 @@ def configure() -> dict:
 
     users = {}
     slot_idx = 0
-    max_user_slots = cfg["slots"]["count"] - 1
+    # reserve last slot for utility if enabled
+    max_user_slots = cfg["slots"]["count"] - 1 if utility_enabled else cfg["slots"]["count"]
 
     while slot_idx < max_user_slots:
         name = ask(f"  User {slot_idx} name (blank to stop)", "")
@@ -237,14 +254,19 @@ def configure() -> dict:
     cfg["guest"]["enabled"] = guest_enabled
 
     if guest_enabled and "guest" not in users:
-        users["guest"] = {"slot": slot_idx, "security": 0}
-        print(f"    -> guest: slot {slot_idx}, GUEST")
-        slot_idx += 1
+        if slot_idx < max_user_slots:
+            users["guest"] = {"slot": slot_idx, "security": 0}
+            print(f"    -> guest: slot {slot_idx}, GUEST")
+            slot_idx += 1
+        else:
+            print("    WARNING: No slots available for guest -- skipping")
+            cfg["guest"]["enabled"] = False
 
-    # utility slot -- always last
-    utility_slot = cfg["slots"]["count"] - 1
-    users["utility"] = {"slot": utility_slot, "security": 4}
-    print(f"    -> utility: slot {utility_slot}, ADMIN")
+    # utility slot -- last slot, only if enabled
+    if utility_enabled:
+        utility_slot = cfg["slots"]["count"] - 1
+        users["utility"] = {"slot": utility_slot, "security": 4}
+        print(f"    -> utility: slot {utility_slot}, ADMIN")
 
     cfg["users"] = users
     print()
@@ -277,6 +299,10 @@ def configure() -> dict:
     print(f"      Summary cap:  ~{summary_cap} tokens")
     print(f"      Recent keep:  ~{recent_cap} tokens")
     print(f"      Headroom:     ~{headroom} tokens until next summarize")
+    if not utility_enabled:
+        print(f"      Mode:         In-place (user slot locked during summarization)")
+    else:
+        print(f"      Mode:         Async (utility lane, no user blocking)")
     print()
 
     sched_enabled = ask_bool("Enable scheduled daily summary?",
@@ -423,6 +449,8 @@ def main():
     print(f"    Slots:        {cfg['slots']['count']}")
     print(f"    Context:      {cfg['slots']['ctx_total']} tokens")
     print(f"    Port:         {cfg['network']['brain_port']}")
+    print(f"    Utility lane: {'enabled' if cfg['utility']['enabled'] else 'disabled (user-slot fallback)'}")
+    print(f"    Guest:        {'enabled' if cfg['guest']['enabled'] else 'disabled'}")
     print()
 
     if ask_bool("Proceed with installation?", True):

@@ -6,9 +6,21 @@
 #
 # ==================================================
 # Conversation summarization and context management.
-# Generates summary via LLM utility slot, preserves
-# recent messages within a token budget, and wipes
-# old history.
+#
+# Two operating modes based on UTILITY_ENABLED:
+#
+# ASYNC MODE (utility lane enabled):
+#   Snapshot the user's history, fire summarization
+#   on the utility slot without locking. User keeps
+#   talking. When done, merge: new summary + recent
+#   messages + any messages that arrived during
+#   summarization. User's slot goes cold on next
+#   message (unavoidable -- conversation state changed).
+#
+# IN-PLACE MODE (utility lane disabled, fallback):
+#   Lock the user's slot, run summarization on the
+#   user's own slot, apply results, unlock. User
+#   waits during summarization (brief lock).
 #
 # Token budgets are percentage-based with a static
 # system header carve-out. This scales across any
@@ -17,23 +29,19 @@
 #   summary cap = remaining * summary_max_percent
 #   recent budget = remaining * keep_recent_percent
 #
-# Lock behavior:
-#   flag_crit -> fire immediately as background task
-#   flag_warn + is_idle -> background timer picks it up
-#   If slot_lock held when message arrives -> wait up
-#   to SUMMARIZE_LOCK_WAIT seconds, then drop.
-#
-# Fallback: if the utility call fails for any reason,
+# Fallback: if the LLM call fails for any reason,
 # emergency_trim() does a dumb trim -- keeps recent
 # messages within budget, preserves existing summary,
 # clears flags. Partial memory beats a bricked user.
 #
 # Background loop also runs proactive health checks
-# on the LLM server and triggers recovery if needed.
+# on the LLM server, triggers recovery if needed,
+# and clears guest history on idle.
 #
 # Knows about: config (thresholds, lock wait, scheduled
-#              settings, idle interval, budgets),
-#              slots (User, save), llm (utility call,
+#              settings, idle interval, budgets,
+#              UTILITY_ENABLED, GUEST_ENABLED),
+#              slots (User, save), llm (internal call,
 #              health, recovery).
 # ==================================================
 
@@ -53,10 +61,21 @@ from config import (
     SUMMARY_MAX_TOKENS,
     KEEP_RECENT_TOKENS,
     CHARS_PER_TOKEN,
+    UTILITY_ENABLED,
+    GUEST_ENABLED,
 )
 from core.slots import User, save_profile, get_all_users
 
 log = structlog.get_logger()
+
+# ==================================================
+# Active Summarization Tracking
+# ==================================================
+# Prevents duplicate async summarizations on the same
+# user. In-place mode uses slot_lock instead.
+# ==================================================
+
+_summarizing_users: set[str] = set()
 
 # ==================================================
 # Token Estimation
@@ -174,9 +193,15 @@ async def _run_scheduled_summary():
     for uid, user in users.items():
         if uid == "utility":
             continue
+        if uid == "guest":
+            # guest doesn't get summarized -- just cleared
+            continue
         try:
-            async with user.slot_lock:
-                await _do_summarize(user)
+            if UTILITY_ENABLED:
+                await _summarize_async(user)
+            else:
+                async with user.slot_lock:
+                    await _summarize_inplace(user)
         except Exception as e:
             log.error("scheduled_summary_user_failed",
                       user_id=uid, error=str(e))
@@ -194,29 +219,48 @@ async def _run_scheduled_summary():
 # ==================================================
 
 async def summarize_if_needed(user: User):
-    # fire-and-forget background task
-    # acquires slot_lock, summarizes, saves profile
-    if user.slot_lock.locked():
-        log.info("slot_lock_held_skip", user_id=user.user_id)
+    # fire-and-forget background task. mode depends on
+    # whether utility lane is enabled.
+    if user.user_id == "guest":
+        # never summarize guest -- just clear on idle
         return
 
-    try:
-        async with user.slot_lock:
-            log.info("summarizing", user_id=user.user_id, slot=user.slot)
-            await _do_summarize(user)
-            log.info("summarization_complete", user_id=user.user_id)
-    except Exception as e:
-        log.error("summarization_failed", user_id=user.user_id, error=str(e))
+    if UTILITY_ENABLED:
+        # async mode -- no lock, snapshot/merge
+        if user.user_id in _summarizing_users:
+            log.info("async_summarize_already_running", user_id=user.user_id)
+            return
+        try:
+            log.info("summarizing_async", user_id=user.user_id, slot=user.slot)
+            await _summarize_async(user)
+            log.info("summarization_async_complete", user_id=user.user_id)
+        except Exception as e:
+            log.error("summarization_async_failed",
+                       user_id=user.user_id, error=str(e))
+    else:
+        # in-place mode -- lock slot, summarize, unlock
+        if user.slot_lock.locked():
+            log.info("slot_lock_held_skip", user_id=user.user_id)
+            return
+        try:
+            async with user.slot_lock:
+                log.info("summarizing_inplace", user_id=user.user_id, slot=user.slot)
+                await _summarize_inplace(user)
+                log.info("summarization_inplace_complete", user_id=user.user_id)
+        except Exception as e:
+            log.error("summarization_inplace_failed",
+                       user_id=user.user_id, error=str(e))
 
 
 async def emergency_summarize(user: User):
     # called by main.py when context overflow is detected
-    # during a call. acquires lock, summarizes, so the
-    # retry has room to work.
+    # during a call. always uses in-place mode with lock
+    # because we need the space NOW -- can't wait for
+    # async utility to finish.
     log.warning("emergency_summarize_triggered", user_id=user.user_id)
     try:
         async with user.slot_lock:
-            await _do_summarize(user)
+            await _summarize_inplace(user)
             log.info("emergency_summarize_complete", user_id=user.user_id)
     except Exception as e:
         log.error("emergency_summarize_failed",
@@ -246,7 +290,7 @@ async def wait_for_lock(user: User) -> bool:
 
 
 # ==================================================
-# Background Loop -- Idle Checks + Health Monitor
+# Background Loop -- Idle + Guest + Health Monitor
 # ==================================================
 
 _background_task: asyncio.Task | None = None
@@ -280,9 +324,21 @@ async def _background_loop(interval: int):
             # proactive LLM health check
             await _check_llm_health()
 
-            # idle summarization checks
             users = get_all_users()
             for uid, user in users.items():
+                if uid == "utility":
+                    continue
+
+                # guest idle clearing -- wipe history, never summarize
+                if uid == "guest" and GUEST_ENABLED:
+                    if user.is_idle() and user.conversation_history:
+                        user.clear_history()
+                        user.summary = ""
+                        save_profile(user)
+                        log.info("guest_history_cleared_on_idle")
+                    continue
+
+                # idle summarization for regular users
                 if user.flag_warn and user.is_idle():
                     await summarize_if_needed(user)
 
@@ -307,10 +363,73 @@ async def _check_llm_health():
 
 
 # ==================================================
-# Internal -- Summarization Logic
+# Internal -- Async Summarization (utility lane)
+# ==================================================
+# Snapshot history, fire on utility slot, no lock.
+# User keeps talking during summarization.
+# Merge when done: new summary + recent + new messages.
 # ==================================================
 
-async def _do_summarize(user: User):
+async def _summarize_async(user: User):
+    if len(user.conversation_history) < 2:
+        log.info("not_enough_history", user_id=user.user_id)
+        return
+
+    if user.user_id in _summarizing_users:
+        return
+    _summarizing_users.add(user.user_id)
+
+    try:
+        # snapshot: remember where the history was when we started
+        snapshot_index = len(user.conversation_history)
+        history_snapshot = list(user.conversation_history[:snapshot_index])
+
+        # split snapshot: messages to summarize vs messages to keep
+        recent = _select_recent_messages(history_snapshot, KEEP_RECENT_TOKENS)
+        keep_count = len(recent)
+        to_summarize = history_snapshot[:-keep_count] if keep_count else history_snapshot
+
+        if not to_summarize:
+            log.info("nothing_to_summarize", user_id=user.user_id,
+                     recent_count=keep_count)
+            return
+
+        # build prompt and call LLM on utility slot
+        new_summary = await _run_summarize_llm(user, to_summarize, fallback_slot=None)
+
+        if new_summary is None:
+            # LLM call failed -- emergency trim using snapshot data
+            _emergency_trim(user, recent)
+            return
+
+        # merge: get any new messages that arrived during summarization
+        new_messages = user.conversation_history[snapshot_index:]
+
+        # apply: new summary + recent from snapshot + anything new
+        user.summary = new_summary
+        user.conversation_history = recent + new_messages
+        user.flag_warn = False
+        user.flag_crit = False
+
+        save_profile(user)
+        log.info("summary_updated_async",
+                 user_id=user.user_id,
+                 kept_recent=len(recent),
+                 new_during_summarize=len(new_messages),
+                 summary_tokens=_estimate_tokens(new_summary))
+
+    finally:
+        _summarizing_users.discard(user.user_id)
+
+
+# ==================================================
+# Internal -- In-Place Summarization (user's slot)
+# ==================================================
+# Lock must be held by caller. Runs summarization on
+# the user's own slot. User waits during this.
+# ==================================================
+
+async def _summarize_inplace(user: User):
     if len(user.conversation_history) < 2:
         log.info("not_enough_history", user_id=user.user_id)
         return
@@ -319,7 +438,6 @@ async def _do_summarize(user: User):
     recent = _select_recent_messages(
         user.conversation_history, KEEP_RECENT_TOKENS
     )
-    # everything before the recent window gets summarized
     keep_count = len(recent)
     to_summarize = user.conversation_history[:-keep_count] if keep_count else user.conversation_history
 
@@ -328,11 +446,44 @@ async def _do_summarize(user: User):
                  recent_count=keep_count)
         return
 
-    # build the summarization prompt using only the old messages
+    # build prompt and call LLM on user's own slot
+    new_summary = await _run_summarize_llm(user, to_summarize, fallback_slot=user.slot)
+
+    if new_summary is None:
+        # LLM call failed -- emergency trim
+        _emergency_trim(user, recent)
+        return
+
+    # apply the new summary and keep only recent messages
+    user.summary = new_summary
+    user.conversation_history = recent
+    user.flag_warn = False
+    user.flag_crit = False
+
+    save_profile(user)
+    log.info("summary_updated_inplace",
+             user_id=user.user_id,
+             kept_recent=len(recent),
+             summary_tokens=_estimate_tokens(new_summary))
+
+
+# ==================================================
+# Internal -- LLM Summarization Call
+# ==================================================
+# Shared prompt building and LLM call logic used by
+# both async and in-place paths. Returns the new
+# summary text, or None if the call failed.
+# ==================================================
+
+async def _run_summarize_llm(
+    user: User,
+    to_summarize: list[dict],
+    fallback_slot: int | None,
+) -> str | None:
     history_text = _format_history(to_summarize)
     existing_summary = user.summary or "(No previous summary)"
 
-    # estimate if the prompt fits in the utility slot
+    # estimate if the prompt fits in the target slot
     prompt_content = (
         f"Previous summary:\n{existing_summary}\n\n"
         f"New conversation:\n{history_text}\n\n"
@@ -349,26 +500,23 @@ async def _do_summarize(user: User):
         _estimate_tokens(prompt_content) + 8  # message framing overhead
     )
 
-    # check if the prompt itself fits in the utility slot
-    # utility slot has the same per-slot context as everyone else
-    utility_budget = CONTEXT_PER_SLOT - SUMMARY_MAX_TOKENS - 16  # leave room for response + framing
-    if estimated_prompt_tokens > utility_budget:
-        # the old messages are too long even after removing recent --
-        # truncate the history text to fit
-        max_history_chars = (utility_budget - _estimate_tokens(system_text) -
+    # check if the prompt fits in the target slot
+    slot_budget = CONTEXT_PER_SLOT - SUMMARY_MAX_TOKENS - 16  # leave room for response + framing
+    if estimated_prompt_tokens > slot_budget:
+        # the old messages are too long -- truncate history to fit
+        max_history_chars = (slot_budget - _estimate_tokens(system_text) -
                              _estimate_tokens(existing_summary) - 50) * CHARS_PER_TOKEN
         if max_history_chars > 0:
             history_text = history_text[:max_history_chars]
             log.warning("summarize_prompt_truncated",
                          user_id=user.user_id,
                          estimated=estimated_prompt_tokens,
-                         budget=utility_budget)
+                         budget=slot_budget)
         else:
-            # can't fit anything -- fall back to emergency trim
-            log.warning("summarize_prompt_too_large_fallback",
+            # can't fit anything -- caller should emergency trim
+            log.warning("summarize_prompt_too_large",
                          user_id=user.user_id)
-            _emergency_trim(user, recent)
-            return
+            return None
 
         # rebuild prompt with truncated history
         prompt_content = (
@@ -384,30 +532,21 @@ async def _do_summarize(user: User):
 
     try:
         from core import llm
-        result = await llm.call_utility(
+        result = await llm.call_internal(
             messages=summary_messages,
             temperature=0.3,
             max_tokens=SUMMARY_MAX_TOKENS,
+            fallback_slot=fallback_slot,
         )
-        new_summary = result.content
+        return result.content
     except Exception as e:
         log.error("summarize_llm_error", user_id=user.user_id, error=str(e))
-        # utility call failed -- do emergency trim so user isn't bricked
-        _emergency_trim(user, recent)
-        return
+        return None
 
-    # apply the new summary and keep only recent messages
-    user.summary = new_summary
-    user.conversation_history = recent
-    user.flag_warn = False
-    user.flag_crit = False
 
-    save_profile(user)
-    log.info("summary_updated",
-             user_id=user.user_id,
-             kept_recent=len(recent),
-             summary_tokens=_estimate_tokens(new_summary))
-
+# ==================================================
+# Emergency Trim
+# ==================================================
 
 def _emergency_trim(user: User, recent: list[dict] | None = None):
     # last resort -- keep recent messages, preserve whatever
@@ -429,6 +568,10 @@ def _emergency_trim(user: User, recent: list[dict] | None = None):
                  old_messages=old_count,
                  kept_messages=len(recent))
 
+
+# ==================================================
+# Helpers
+# ==================================================
 
 def _format_history(history: list[dict]) -> str:
     lines = []
